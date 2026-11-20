@@ -65,6 +65,8 @@ func main() {
 		termWidth:  80,
 		termHeight: 60,
 		positions:  make(map[string]position),
+		hoverC:     -1,
+		hoverR:     -1,
 	}
 
 	if statusBar, ok := os.LookupEnv("WALK_STATUS_BAR"); ok {
@@ -124,9 +126,10 @@ func main() {
 
 	opts := []tea.ProgramOption{
 		tea.WithOutput(os.Stderr),
-	}
-	if m.previewMode {
-		opts = append(opts, tea.WithAltScreen())
+		tea.WithMouseAllMotion(),
+		// Mouse coordinates are absolute screen rows, so the listing has to
+		// own the whole screen for them to map back to the grid.
+		tea.WithAltScreen(),
 	}
 
 	p := tea.NewProgram(m, opts...)
@@ -148,10 +151,13 @@ type model struct {
 	files                 []fs.DirEntry       // Files we are looking at.
 	err                   error               // Error while listing files.
 	c, r                  int                 // Selector position in columns and rows.
+	hoverC, hoverR        int                 // Cell under the mouse pointer, -1 when outside the grid.
 	columns, rows         int                 // Displayed amount of rows and columns.
 	termWidth, termHeight int                 // Terminal size.
 	offset                int                 // Scroll position.
 	positions             map[string]position // Map of cursor positions per path.
+	names                 [][]string          // Grid from the last render, for mapping mouse coordinates.
+	previewPath           string              // File the current preview content came from.
 	search                string              // Type to select files with this value.
 	searchMode            bool                // Whether type-to-select is active.
 	searchId              int                 // Search id to indicate what search we are currently on.
@@ -183,6 +189,18 @@ type toDelete struct {
 	at   time.Time
 }
 
+// Virtual ".." entry: os.ReadDir never returns it, so walk makes its own.
+type parentEntry struct {
+	path string
+}
+
+func (p parentEntry) Name() string      { return ".." }
+func (p parentEntry) IsDir() bool       { return true }
+func (p parentEntry) Type() fs.FileMode { return fs.ModeDir }
+func (p parentEntry) Info() (fs.FileInfo, error) {
+	return os.Stat(p.path)
+}
+
 type (
 	clearSearchMsg int
 	toBeDeletedMsg int
@@ -211,6 +229,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Also, m.c&r no longer point to the correct indexes.
 		m.c = 0
 		m.r = 0
+		return m, nil
+
+	case tea.MouseMsg:
+		switch msg.Action {
+		case tea.MouseActionPress:
+			switch msg.Button {
+			case tea.MouseButtonLeft:
+				if msg.Y == 0 {
+					m.quit()
+					return m, tea.Quit
+				}
+				m.click(msg.X, msg.Y)
+			case tea.MouseButtonRight:
+				m.back()
+			}
+		case tea.MouseActionMotion:
+			m.hoverAt(msg.X, msg.Y)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -263,9 +299,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case key.Matches(msg, keyQuit, keyQuitQ):
-			m.quitting = true
-			m.exitCode = 0
-			m.performPendingDeletions()
+			m.quit()
 			return m, tea.Quit
 
 		case key.Matches(msg, keyOpen):
@@ -277,35 +311,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if fi := fileInfo(filePath); fi.IsDir() {
 				// Enter subdirectory.
-				m.path = filePath
-				if p, ok := m.positions[m.path]; ok {
-					m.c = p.c
-					m.r = p.r
-					m.offset = p.offset
-				} else {
-					m.c = 0
-					m.r = 0
-					m.offset = 0
-				}
-				m.list()
+				m.enter(filePath)
 			} else {
 				// Open file. This will block until complete.
 				return m, m.open()
 			}
 
 		case key.Matches(msg, keyBack):
-			m.search = ""
-			m.searchMode = false
-			m.prevName = filepath.Base(m.path)
-			m.path = filepath.Join(m.path, "..")
-			if p, ok := m.positions[m.path]; ok {
-				m.c = p.c
-				m.r = p.r
-				m.offset = p.offset
-			} else {
-				m.findPrevName = true
-			}
-			m.list()
+			m.back()
 			return m, nil
 
 		case key.Matches(msg, keyUp):
@@ -375,6 +388,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case key.Matches(msg, keyDelete, keyFnDelete):
+			if f, ok := m.currentFile(); ok {
+				if _, isParent := f.(parentEntry); isParent {
+					return m, nil // ".." is not deletable.
+				}
+			}
 			filePathToDelete, ok := m.filePath()
 			if ok {
 				if m.deleteCurrentFile {
@@ -385,6 +403,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					})
 					m.list()
 					m.previewContent = ""
+					m.previewPath = ""
 					return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
 						return toBeDeletedMsg(0)
 					})
@@ -409,7 +428,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				destDir := m.path
 				baseName := filepath.Base(m.yankedFilePath)
 				destPath := filepath.Join(destDir, baseName)
-				
+
 				// Don't paste if file already exists
 				if _, err := os.Stat(destPath); err == nil {
 					m.pasteError = "file already exists"
@@ -508,6 +527,7 @@ func (m *model) View() string {
 			m.r = j
 		}
 	})
+	m.names = names
 
 	// If we need to select previous directory on "up".
 	if m.findPrevName {
@@ -547,6 +567,9 @@ func (m *model) View() string {
 				} else {
 					row[i] = cursor.Render(names[i][j])
 				}
+			} else if i == m.hoverC && j == m.hoverR {
+				name := TrimRight(names[i][j], " ")
+				row[i] = hover.Render(name) + Repeat(" ", strlen(names[i][j])-strlen(name))
 			} else {
 				row[i] = names[i][j]
 			}
@@ -737,6 +760,12 @@ func (m *model) list() {
 	var err error
 	m.files = nil
 
+	// os.ReadDir does not return "..", so walk adds it as the first entry.
+	parent := path.Dir(m.path)
+	if parent != m.path {
+		m.files = append(m.files, parentEntry{parent})
+	}
+
 	// ReadDir already returns files and dirs sorted by filename.
 	files, err := os.ReadDir(m.path)
 	if err != nil {
@@ -817,6 +846,94 @@ func (m *model) saveCursorPosition() {
 	}
 }
 
+func (m *model) enter(filePath string) {
+	m.path = filePath
+	if p, ok := m.positions[m.path]; ok {
+		m.c = p.c
+		m.r = p.r
+		m.offset = p.offset
+	} else {
+		m.c = 0
+		m.r = 0
+		m.offset = 0
+	}
+	m.list()
+}
+
+func (m *model) back() {
+	m.search = ""
+	m.searchMode = false
+	m.prevName = filepath.Base(m.path)
+	m.path = filepath.Join(m.path, "..")
+	if p, ok := m.positions[m.path]; ok {
+		m.c = p.c
+		m.r = p.r
+		m.offset = p.offset
+	} else {
+		m.findPrevName = true
+	}
+	m.list()
+}
+
+func (m *model) quit() {
+	m.quitting = true
+	m.exitCode = 0
+	m.performPendingDeletions()
+}
+
+// Click selects a file in the grid. Clicking a directory enters it.
+// cellAt maps a mouse coordinate to the grid cell under it, using the grid
+// from the last render.
+func (m *model) cellAt(x, y int) (int, int, bool) {
+	if y == 0 {
+		return 0, 0, false // Location bar.
+	}
+	columns, rows := m.columns, m.rows
+	if columns == 0 || len(m.names) != columns {
+		return 0, 0, false
+	}
+	j := y - 1 + m.offset
+	if j < 0 || j >= rows {
+		return 0, 0, false
+	}
+	for i := 0; i < columns; i++ {
+		w := 0
+		for _, name := range m.names[i] {
+			w = max(w, strlen(name))
+		}
+		if x < w {
+			if i*rows+j >= len(m.files) {
+				return 0, 0, false // Padding, not a file.
+			}
+			return i, j, true
+		}
+		x -= w + len(separator)
+	}
+	return 0, 0, false
+}
+
+// Click selects the file under the pointer. Clicking a directory enters it.
+func (m *model) click(x, y int) {
+	i, j, ok := m.cellAt(x, y)
+	if !ok {
+		return
+	}
+	m.c, m.r = i, j
+	m.updateOffset()
+	m.saveCursorPosition()
+	file := m.files[i*m.rows+j]
+	if file.IsDir() {
+		m.enter(path.Join(m.path, file.Name()))
+	}
+}
+
+func (m *model) hoverAt(x, y int) {
+	m.hoverC, m.hoverR = -1, -1
+	if i, j, ok := m.cellAt(x, y); ok {
+		m.hoverC, m.hoverR = i, j
+	}
+}
+
 func (m *model) currentFile() (fs.DirEntry, bool) {
 	i := m.c*m.rows + m.r
 	if i >= len(m.files) || i < 0 {
@@ -846,7 +963,7 @@ func (m *model) pasteFile(srcPath, destPath string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	if srcInfo.IsDir() {
 		return copyDir(srcPath, destPath)
 	}
@@ -885,6 +1002,11 @@ func (m *model) preview() {
 		m.previewContent = warning.Render("Invalid file to preview")
 		return
 	}
+
+	if filePath == m.previewPath {
+		return // Same file, content already rendered.
+	}
+	m.previewPath = filePath
 
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
@@ -994,11 +1116,6 @@ func wrap(files []os.DirEntry, width int, height int, callback func(name string,
 	// Max number of files to display in one column is 10 or 4 columns in total.
 	columnsEstimate := int(math.Ceil(float64(len(files)) / 10))
 	columns = max(columns, min(columnsEstimate, 4))
-
-	// For large lists, don't use more than 2 columns.
-	if len(files) > 100 {
-		columns = 2
-	}
 
 	// Fifteenth column is enough for everyone.
 	if columns > 15 {

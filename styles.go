@@ -11,6 +11,7 @@ var (
 	bold         lipgloss.Style
 	warning      lipgloss.Style
 	cursor       lipgloss.Style
+	hover        lipgloss.Style
 	bar          lipgloss.Style
 	search       lipgloss.Style
 	danger       lipgloss.Style
@@ -22,6 +23,7 @@ func initStyles() {
 	bold = lipgloss.NewStyle().Bold(true)
 	warning = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).PaddingLeft(1).PaddingRight(1)
 	cursor = lipgloss.NewStyle().Background(mainColor).Foreground(lipgloss.Color("#FFFFFF"))
+	hover = lipgloss.NewStyle().Underline(true)
 	bar = lipgloss.NewStyle().Background(barColor).Foreground(lipgloss.Color("#FFFFFF"))
 	search = lipgloss.NewStyle().Background(searchColor).Foreground(lipgloss.Color("#FFFFFF"))
 	danger = lipgloss.NewStyle().Background(lipgloss.Color("#FF0000")).Foreground(lipgloss.Color("#FFFFFF"))

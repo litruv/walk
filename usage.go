@@ -24,6 +24,9 @@ func usage(out io.Writer, full bool) {
 	put("    d, delete\tDelete file or dir")
 	put("    y\tCopy to clipboard")
 	put("    .\tHide hidden files")
+	put("    click\tSelect file, enter directory")
+	put("    right click\tGo to parent directory")
+	put("    click title\tQuit, prints current path")
 	put("    ?\tShow help")
 	if full {
 		put("\n  Flags:\n")
